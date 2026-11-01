@@ -463,6 +463,17 @@ adminVaultRouter.get(['/api/v1/admin/runtime-config', '/api/v1/public/runtime-co
     cloudinary: {
       cloudName: process.env.CLOUDINARY_CLOUD_NAME || process.env.VITE_CLOUDINARY_CLOUD_NAME || '',
     },
+    turnstile: {
+      siteKey: (
+        process.env.VITE_TURNSTILE_SITE_KEY ||
+        process.env.TURNSTILE_SITE_KEY ||
+        process.env.CF_TURNSTILE_SITE_KEY ||
+        process.env.CLOUDFLARE_TURNSTILE_SITE_KEY ||
+        process.env.PUBLIC_TURNSTILE_SITE_KEY ||
+        process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY ||
+        ''
+      ).trim().replace(/^["'`]+|["'`]+$/g, '').trim(),
+    },
   });
 });
 
@@ -541,13 +552,44 @@ adminVaultRouter.get('/api/v1/admin/data', async (req, res) => {
     const localData: any = getMergedData();
     const fromFirestore = Boolean(storeData?.fromFirestore);
 
+    const mergedSettings =
+      storeData.settings && Object.keys(storeData.settings).length > 0
+        ? { ...storeData.settings }
+        : { ...(localData.settings || {}) };
+    const envSiteKey = (
+      process.env.VITE_TURNSTILE_SITE_KEY ||
+      process.env.TURNSTILE_SITE_KEY ||
+      process.env.CF_TURNSTILE_SITE_KEY ||
+      process.env.CLOUDFLARE_TURNSTILE_SITE_KEY ||
+      process.env.PUBLIC_TURNSTILE_SITE_KEY ||
+      process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY ||
+      ''
+    ).trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    const envSecretKey = (
+      process.env.TURNSTILE_SECRET_KEY ||
+      process.env.VITE_TURNSTILE_SECRET_KEY ||
+      process.env.CF_TURNSTILE_SECRET_KEY ||
+      process.env.CLOUDFLARE_TURNSTILE_SECRET_KEY ||
+      process.env.TURNSTILE_SECRET ||
+      process.env.VITE_TURNSTILE_SECRET ||
+      process.env.TURNSTILE_TOKEN ||
+      process.env.VITE_TURNSTILE_TOKEN ||
+      ''
+    ).trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    if (!mergedSettings.turnstile_site_key && envSiteKey) {
+      mergedSettings.turnstile_site_key = envSiteKey;
+    }
+    if (!mergedSettings.turnstile_secret_key && envSecretKey) {
+      mergedSettings.turnstile_secret_key = envSecretKey;
+    }
+
     res.json({
       success: true,
       source: isConfigured ? 'firebase' : 'local_backup',
       apps: fromFirestore
         ? (Array.isArray(storeData.apps) ? storeData.apps : [])
         : ((storeData.apps && storeData.apps.length > 0) ? storeData.apps : (localData.apps || [])),
-      settings: (storeData.settings && Object.keys(storeData.settings).length > 0) ? storeData.settings : (localData.settings || {}),
+      settings: mergedSettings,
       news: fromFirestore
         ? (Array.isArray(storeData.news) ? storeData.news : [])
         : ((storeData.news && storeData.news.length > 0) ? storeData.news : (localData.news || [])),
@@ -694,9 +736,20 @@ adminVaultRouter.post(['/api/v1/admin/app/save', '/api/v1/admin/save-single-app'
         const ciphertext = hasV2Key
           ? (await encryptAesGcmV2(jsonPayload, process.env as Record<string, string | undefined>)) || safeEncrypt(jsonPayload, AES_SECRET)
           : safeEncrypt(jsonPayload, AES_SECRET);
+        const rawTsSecret = String(
+          current.settings?.turnstile_secret_key ||
+            process.env.TURNSTILE_SECRET_KEY ||
+            process.env.VITE_TURNSTILE_SECRET_KEY ||
+            ''
+        ).trim();
+        const encryptedTurnstileSecret = rawTsSecret
+          ? (hasV2Key
+              ? (await encryptAesGcmV2(rawTsSecret, process.env as Record<string, string | undefined>)) || safeEncrypt(rawTsSecret, AES_SECRET)
+              : safeEncrypt(rawTsSecret, AES_SECRET))
+          : '';
         if (ciphertext) {
           const vaultFilePath = path.join(process.cwd(), 'src/lib/secureVault.ts');
-          fs.writeFileSync(vaultFilePath, generateSecureVaultFile(ciphertext), 'utf8');
+          fs.writeFileSync(vaultFilePath, generateSecureVaultFile(ciphertext, encryptedTurnstileSecret), 'utf8');
         }
       } catch (vaultErr) {
         console.warn('[adminVaultRoutes] Notice updating vault on single app save:', vaultErr);
@@ -1009,7 +1062,7 @@ adminVaultRouter.post('/api/v1/admin/encrypt-links', async (req, res) => {
 
 adminVaultRouter.post('/api/v1/admin/seal-vault', async (req, res) => {
   try {
-    const { items } = req.body || {};
+    const { items, turnstileSecretKey } = req.body || {};
     const { encryptAesGcmV2, decryptVaultValue } = await import('../crypto.js');
     const { setRamVaultLink, isValidDestinationUrl } = await import('../services/linkService.js');
     const AES_SECRET = getAesSecret();
@@ -1050,15 +1103,45 @@ adminVaultRouter.post('/api/v1/admin/seal-vault', async (req, res) => {
       ? (await encryptAesGcmV2(jsonPayload, process.env as Record<string, string | undefined>)) || safeEncrypt(jsonPayload, AES_SECRET)
       : safeEncrypt(jsonPayload, AES_SECRET);
 
+    const current = getMergedData();
+    const rawTsSecret = String(
+      turnstileSecretKey ||
+        current.settings?.turnstile_secret_key ||
+        process.env.TURNSTILE_SECRET_KEY ||
+        process.env.VITE_TURNSTILE_SECRET_KEY ||
+        process.env.CF_TURNSTILE_SECRET_KEY ||
+        process.env.CLOUDFLARE_TURNSTILE_SECRET_KEY ||
+        process.env.TURNSTILE_SECRET ||
+        process.env.VITE_TURNSTILE_SECRET ||
+        process.env.TURNSTILE_TOKEN ||
+        process.env.VITE_TURNSTILE_TOKEN ||
+        ''
+    ).trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    const rawTsSiteKey = String(
+      current.settings?.turnstile_site_key ||
+        process.env.VITE_TURNSTILE_SITE_KEY ||
+        process.env.TURNSTILE_SITE_KEY ||
+        process.env.CF_TURNSTILE_SITE_KEY ||
+        process.env.CLOUDFLARE_TURNSTILE_SITE_KEY ||
+        process.env.PUBLIC_TURNSTILE_SITE_KEY ||
+        process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY ||
+        ''
+    ).trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+    const encryptedTurnstileSecret = rawTsSecret
+      ? (hasV2Key
+          ? (await encryptAesGcmV2(rawTsSecret, process.env as Record<string, string | undefined>)) || safeEncrypt(rawTsSecret, AES_SECRET)
+          : safeEncrypt(rawTsSecret, AES_SECRET))
+      : '';
+
     if (ciphertext) {
       try {
         const vaultFilePath = path.join(process.cwd(), 'src/lib/secureVault.ts');
-        fs.writeFileSync(vaultFilePath, generateSecureVaultFile(ciphertext), 'utf8');
+        fs.writeFileSync(vaultFilePath, generateSecureVaultFile(ciphertext, encryptedTurnstileSecret), 'utf8');
       } catch (e) {
         console.warn('[adminVaultRoutes] Could not write src/lib/secureVault.ts:', e);
       }
     }
-    res.json({ success: true, ciphertext });
+    res.json({ success: true, ciphertext, encryptedTurnstileSecret, turnstileSiteKey: rawTsSiteKey });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message });
   }
@@ -1066,8 +1149,8 @@ adminVaultRouter.post('/api/v1/admin/seal-vault', async (req, res) => {
 
 adminVaultRouter.post('/api/v1/admin/build-public-api', async (req, res) => {
   try {
-    const { ciphertext } = req.body || {};
-    const content = generateSecureVaultFile(String(ciphertext || ''));
+    const { ciphertext, encryptedTurnstileSecret } = req.body || {};
+    const content = generateSecureVaultFile(String(ciphertext || ''), String(encryptedTurnstileSecret || ''));
     res.json({ success: true, content });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message });

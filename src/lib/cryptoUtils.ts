@@ -1,12 +1,17 @@
 import CryptoJS from 'crypto-js';
 
 export const INTERNAL_VAULT_FALLBACK_KEY = 'default-v12-vault-aes-fallback-secret-32-bytes';
+export const LEGACY_VAULT_FALLBACK_KEY = 'default-v12-vault-aes-legacy-secret-32-bytes';
+export const CLIENT_VAULT_FALLBACK_KEY = 'yono_secure_vault_key_2026_x99_production_master_secret';
 
 export function getEnvSecretKeys(explicitKey?: string): string[] {
   const keys: string[] = [];
   const add = (k?: string) => {
-    if (k && typeof k === 'string' && k.trim().length > 0 && !keys.includes(k.trim())) {
-      keys.push(k.trim());
+    if (k && typeof k === 'string') {
+      const clean = k.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+      if (clean.length > 0 && !keys.includes(clean)) {
+        keys.push(clean);
+      }
     }
   };
   add(explicitKey);
@@ -30,6 +35,8 @@ export function getEnvSecretKeys(explicitKey?: string): string[] {
     // ignore
   }
   add(INTERNAL_VAULT_FALLBACK_KEY);
+  add(LEGACY_VAULT_FALLBACK_KEY);
+  add(CLIENT_VAULT_FALLBACK_KEY);
   return keys;
 }
 

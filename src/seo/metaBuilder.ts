@@ -95,9 +95,10 @@ export function buildMetaTags(params: MetaBuilderParams): string {
     ].filter(Boolean).join('\n    ');
   })();
 
+  const primaryIconMime = resolvedFaviconIco.endsWith('.ico') ? 'image/x-icon' : 'image/png';
   const iconLinksHtml = `
-    <link data-rh="true" rel="icon" type="image/x-icon" href="${escapeHtml(resolvedFaviconIco)}">
-    <link data-rh="true" rel="shortcut icon" href="${escapeHtml(resolvedFaviconIco)}">
+    <link data-rh="true" rel="icon" type="${primaryIconMime}" href="${escapeHtml(resolvedFaviconIco)}">
+    <link data-rh="true" rel="shortcut icon" type="${primaryIconMime}" href="${escapeHtml(resolvedFaviconIco)}">
     <link data-rh="true" rel="icon" type="image/png" sizes="48x48" href="${escapeHtml(resolvedFavicon48)}">
     <link data-rh="true" rel="icon" type="image/png" sizes="96x96" href="${escapeHtml(resolvedFavicon96)}">
     <link data-rh="true" rel="icon" type="image/png" sizes="144x144" href="${escapeHtml(resolvedFavicon144)}">
@@ -105,7 +106,7 @@ export function buildMetaTags(params: MetaBuilderParams): string {
     <link data-rh="true" rel="icon" type="image/png" sizes="512x512" href="${escapeHtml(resolvedFavicon512)}">
     <link data-rh="true" rel="icon" type="image/png" sizes="32x32" href="${escapeHtml(resolvedFavicon32)}">
     <link data-rh="true" rel="icon" type="image/png" sizes="16x16" href="${escapeHtml(resolvedFavicon16)}">
-    <link data-rh="true" rel="apple-touch-icon" sizes="180x180" href="${escapeHtml(resolvedFavicon180)}">
+    <link data-rh="true" rel="apple-touch-icon" type="image/png" sizes="180x180" href="${escapeHtml(resolvedFavicon180)}">
     <link data-rh="true" rel="manifest" href="/site.webmanifest">`;
 
   if (pageType === 'gateway') {
@@ -136,6 +137,8 @@ export function buildMetaTags(params: MetaBuilderParams): string {
     ${keywords ? `<meta name="keywords" content="${escapedKeywords}">` : ''}
     ${isHomePage && resolvedSiteName ? `<meta data-rh="true" name="application-name" content="${resolvedSiteName}">` : ''}
     <meta data-rh="true" name="color-scheme" content="light dark">
+    <meta data-rh="true" name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">
+    <meta data-rh="true" name="theme-color" media="(prefers-color-scheme: dark)" content="#090d16">
     ${isNotFound
       ? `<meta data-rh="true" name="robots" content="noindex, nofollow, noarchive, nosnippet">`
       : `<meta data-rh="true" name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">`

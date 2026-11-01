@@ -577,29 +577,49 @@ export function useGitHubSync(
     const catalogStatsCode = JSON.stringify(communityStatsPayload || { appCounts: {}, totalReviews: 0 });
     const staticReviewsCode = JSON.stringify(communityReviewsPayload);
 
-    try {
-      const idToken = await getAdminToken();
-      if (idToken) {
-        log("GitHub Sync: Synchronizing local static files and sitemaps...");
-        await adminFetch('/api/v1/admin/sync-local', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${idToken}` },
-          body: JSON.stringify({
-            apps: safeBackupApps,
-            settings: finalSettings,
-            news: publicNews,
-            videos: targetVideos,
-            catalogStats: communityStatsPayload || null,
-            staticReviews: communityReviewsPayload || null
-          })
-        });
+    const isLocalDevHost = typeof window !== 'undefined' && (
+      window.location.hostname === 'localhost' ||
+      window.location.hostname === '127.0.0.1' ||
+      window.location.hostname.includes('.run.app')
+    );
+
+    if (isLocalDevHost) {
+      try {
+        const idToken = await getAdminToken();
+        if (idToken) {
+          log("GitHub Sync: Synchronizing local dev static files and sitemaps...");
+          await adminFetch('/api/v1/admin/sync-local', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${idToken}` },
+            body: JSON.stringify({
+              apps: safeBackupApps,
+              settings: finalSettings,
+              news: publicNews,
+              videos: targetVideos,
+              catalogStats: communityStatsPayload || null,
+              staticReviews: communityReviewsPayload || null
+            })
+          });
+        }
+      } catch (localSyncErr: any) {
+        log(`GitHub Sync Notice: Local files backup note: ${localSyncErr?.message || 'skipped'}`);
       }
-    } catch (localSyncErr: any) {
-      log(`GitHub Sync Notice: Local files backup note: ${localSyncErr?.message || 'skipped'}`);
     }
 
     let targetRepo = (configToUse.repo || (import.meta as any).env?.VITE_GITHUB_PUBLIC_REPO || '').trim();
     if (!configToUse.owner || !targetRepo) throw new Error("Missing GitHub repository owner or repository name configuration.");
+
+    const lowerTargetRepo = targetRepo.toLowerCase();
+    if (
+      lowerTargetRepo === 'admin' ||
+      lowerTargetRepo.endsWith('/admin') ||
+      lowerTargetRepo.endsWith('-admin') ||
+      lowerTargetRepo.includes('masterworld')
+    ) {
+      throw new Error(
+        `Invalid target repository "${targetRepo}": Admin website runs 100% on Firebase and does not use static GitHub pushes. Please set your GitHub Repository to the Public Website repository.`
+      );
+    }
 
     try {
       log(`GitHub Sync: Preparing complete compressed release bundle for "${targetRepo}"...`);
@@ -607,23 +627,48 @@ export function useGitHubSync(
       // 1. Pre-build AES Encrypted Vault & Public API bundle so all files can be committed together
       let vaultCode = "";
       let apiBundleContent = "";
+      let activeUpdatedCode = updatedCode;
+      let activeStaticJsonCode = staticJsonCode;
 
       try {
         log(`GitHub Sync: Building AES Encrypted Vault...`);
         let vaultCiphertext = "";
+        let encryptedTurnstileSecret = "";
 
         try {
           const idToken = await getAdminToken();
           const vaultRes = await adminFetch('/api/v1/admin/seal-vault', {
              method: 'POST',
              headers: { 'Content-Type': 'application/json', ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {}) },
-             body: JSON.stringify({ items: publicApps })
+             body: JSON.stringify({
+               items: publicApps,
+               turnstileSecretKey: finalSettings?.turnstile_secret_key || ''
+             })
           });
 
           if (vaultRes.ok) {
             const vaultData = await vaultRes.json();
             if (vaultData.ciphertext) {
               vaultCiphertext = vaultData.ciphertext;
+            }
+            if (vaultData.encryptedTurnstileSecret) {
+              encryptedTurnstileSecret = vaultData.encryptedTurnstileSecret;
+            }
+            if (
+              vaultData.turnstileSiteKey &&
+              typeof vaultData.turnstileSiteKey === 'string' &&
+              vaultData.turnstileSiteKey.trim() &&
+              !finalSettings.turnstile_site_key
+            ) {
+              finalSettings.turnstile_site_key = vaultData.turnstileSiteKey.trim();
+              activeUpdatedCode = generateStaticDataFileCode(publicApps, finalSettings, publicNews, targetVideos);
+              activeStaticJsonCode = JSON.stringify({
+                apps: cleanPublicStaticApps,
+                settings: sanitizePublicSettings(finalSettings),
+                news: publicNews,
+                videos: targetVideos,
+                reviews: []
+              });
             }
           }
         } catch (_) {}
@@ -647,8 +692,18 @@ export function useGitHubSync(
           vaultCiphertext = safeEncrypt(JSON.stringify(vaultMap), AES_SECRET);
         }
 
+        if (
+          !encryptedTurnstileSecret &&
+          finalSettings?.turnstile_secret_key &&
+          typeof finalSettings.turnstile_secret_key === 'string' &&
+          finalSettings.turnstile_secret_key.trim()
+        ) {
+          const AES_SECRET = getAesSecret();
+          encryptedTurnstileSecret = safeEncrypt(finalSettings.turnstile_secret_key.trim(), AES_SECRET);
+        }
+
         if (vaultCiphertext) {
-          vaultCode = generateSecureVaultFile(vaultCiphertext);
+          vaultCode = generateSecureVaultFile(vaultCiphertext, encryptedTurnstileSecret);
           log(`GitHub Sync: ✅ AES Encrypted Vault sealed.`);
         }
       } catch (vaultErr: any) {
@@ -659,7 +714,7 @@ export function useGitHubSync(
       const primaryBatchFiles: { path: string; content: string }[] = [
         {
           path: 'src/lib/staticData.ts',
-          content: updatedCode
+          content: activeUpdatedCode
         },
         {
           path: 'src/lib/communityCatalogStats.json',
@@ -671,11 +726,11 @@ export function useGitHubSync(
         },
         {
           path: 'src/lib/staticData.json',
-          content: staticJsonCode
+          content: activeStaticJsonCode
         },
         {
           path: 'public-api/staticData.json',
-          content: staticJsonCode
+          content: activeStaticJsonCode
         }
       ];
 
@@ -716,12 +771,16 @@ export function useGitHubSync(
 
       // Generate XML sitemaps, site.webmanifest, and opensearch.xml for instant static hosting and search engine discoverability
       try {
-        const sitemaps = generateAllSitemaps({
-          apps: publicApps,
-          settings: finalSettings,
-          news: publicNews,
-          videos: targetVideos
-        });
+        const publicDomain = ((import.meta as any).env?.VITE_PUBLIC_DOMAIN || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
+        const sitemaps = generateAllSitemaps(
+          {
+            apps: publicApps,
+            settings: finalSettings,
+            news: publicNews,
+            videos: targetVideos
+          },
+          publicDomain
+        );
         for (const [filename, xmlContent] of Object.entries(sitemaps)) {
           primaryBatchFiles.push({
             path: `public/${filename}`,
@@ -729,7 +788,6 @@ export function useGitHubSync(
           });
         }
 
-        const publicDomain = ((import.meta as any).env?.VITE_PUBLIC_DOMAIN || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
         const sitemapLines = publicDomain
           ? `\nSitemap: ${publicDomain}/sitemap.xml\nSitemap: ${publicDomain}/sitemap-news.xml\nSitemap: ${publicDomain}/sitemap-apps.xml\nSitemap: ${publicDomain}/sitemap-static.xml\nSitemap: ${publicDomain}/sitemap-videos.xml\nSitemap: ${publicDomain}/sitemap-developers.xml\n`
           : '';
@@ -752,6 +810,24 @@ export function useGitHubSync(
           orientation: 'portrait',
           lang: 'en-IN',
           icons: [
+            {
+              src: icons.favicon48 || '/favicon-32x32.png',
+              sizes: '48x48',
+              type: 'image/png',
+              purpose: 'any'
+            },
+            {
+              src: icons.favicon96 || '/apple-touch-icon.png',
+              sizes: '96x96',
+              type: 'image/png',
+              purpose: 'any'
+            },
+            {
+              src: icons.favicon144 || '/apple-touch-icon.png',
+              sizes: '144x144',
+              type: 'image/png',
+              purpose: 'any'
+            },
             {
               src: icons.android192 || '/android-chrome-192x192.png',
               sizes: '192x192',
@@ -780,10 +856,13 @@ export function useGitHubSync(
         });
 
         const openSearchTitle = (siteTitle || 'Search').replace(/[<>&'"]/g, '');
-        const openSearchIcon = icons.favicon16
-          ? `\n  <Image width="16" height="16" type="image/png">${icons.favicon16.replace(/&/g, '&amp;')}</Image>`
-          : '';
-        const openSearchXml = `<?xml version="1.0" encoding="UTF-8"?>\n<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">\n  <ShortName>${openSearchTitle}</ShortName>\n  <Description>Search applications</Description>\n  <InputEncoding>UTF-8</InputEncoding>${openSearchIcon}\n  <Url type="text/html" template="${publicDomain || ''}/?s={searchTerms}"/>\n</OpenSearchDescription>\n`;
+        const openSearchIcons = [
+          icons.favicon16 ? `  <Image width="16" height="16" type="image/png">${icons.favicon16.replace(/&/g, '&amp;')}</Image>` : '',
+          icons.favicon32 ? `  <Image width="32" height="32" type="image/png">${icons.favicon32.replace(/&/g, '&amp;')}</Image>` : '',
+          icons.favicon48 ? `  <Image width="48" height="48" type="image/png">${icons.favicon48.replace(/&/g, '&amp;')}</Image>` : '',
+          icons.searchLogo512 ? `  <Image width="512" height="512" type="image/png">${icons.searchLogo512.replace(/&/g, '&amp;')}</Image>` : ''
+        ].filter(Boolean).join('\n');
+        const openSearchXml = `<?xml version="1.0" encoding="UTF-8"?>\n<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">\n  <ShortName>${openSearchTitle}</ShortName>\n  <Description>Search applications</Description>\n  <InputEncoding>UTF-8</InputEncoding>\n${openSearchIcons}\n  <Url type="text/html" template="${publicDomain || ''}/?s={searchTerms}"/>\n</OpenSearchDescription>\n`;
         primaryBatchFiles.push({
           path: 'public/opensearch.xml',
           content: openSearchXml

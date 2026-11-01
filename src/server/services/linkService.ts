@@ -1,5 +1,6 @@
 import { ENCRYPTED_LINKS, ENCRYPTED_TURNSTILE_SECRET } from '../../lib/secureVault.js';
 import { decryptVaultValue } from '../crypto.js';
+import bundledStaticData from '../../lib/staticData.json';
 
 export interface LinkResolutionResult {
   url: string | null;
@@ -9,6 +10,7 @@ export interface LinkResolutionResult {
 const ramCache = new Map<string, string>();
 let t1Loaded = false;
 let t2Loaded = false;
+let t3CircuitBrokenUntil = 0;
 let cachedTurnstileSecretFromStore: { secret: string; expiresAt: number } | null = null;
 
 function normalizeIdentifier(id: string): string {
@@ -16,6 +18,36 @@ function normalizeIdentifier(id: string): string {
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]/g, '');
+}
+
+function sanitizeKey(raw: unknown): string {
+  if (!raw || typeof raw !== 'string') return '';
+  return raw.trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+}
+
+function isTestTurnstileKey(k: string): boolean {
+  return (
+    k.startsWith('1x00000000000000000000') ||
+    k.startsWith('2x00000000000000000000') ||
+    k.startsWith('3x00000000000000000000')
+  );
+}
+
+function isRealTurnstileKeyValue(k: unknown): k is string {
+  const trimmed = sanitizeKey(k);
+  if (trimmed.length < 10) return false;
+  if (
+    trimmed.includes('<') ||
+    trimmed.includes('>') ||
+    trimmed.includes('REPLACE_') ||
+    trimmed.includes('YOUR_') ||
+    trimmed === 'PLACEHOLDER' ||
+    trimmed === 'undefined' ||
+    trimmed === 'null'
+  ) {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -179,23 +211,36 @@ async function loadT1Vault(
   return {};
 }
 
+async function loadStaticDataSnapshot(): Promise<Record<string, any> | null> {
+  try {
+    if (typeof process !== 'undefined' && typeof process.cwd === 'function') {
+      const fsMod = await import('fs').catch(() => null);
+      const pathMod = await import('path').catch(() => null);
+      if (fsMod && pathMod) {
+        const backupPath = pathMod.join(process.cwd(), 'src', 'lib', 'staticData.json');
+        if (fsMod.existsSync(backupPath)) {
+          const raw = fsMod.readFileSync(backupPath, 'utf-8');
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') return parsed;
+        }
+      }
+    }
+  } catch {
+    // Fall through to bundledStaticData on Cloudflare Workers/Pages
+  }
+  if (bundledStaticData && typeof bundledStaticData === 'object') {
+    return bundledStaticData as Record<string, any>;
+  }
+  return null;
+}
+
 async function resolveFromT2Backup(
   identifier: string,
   env?: Record<string, string | undefined>
 ): Promise<string | null> {
   try {
-    // Dynamic import so Cloudflare Workers/Pages without Node fs never fail at module load
-    if (typeof process === 'undefined' || typeof process.cwd !== 'function') {
-      return null;
-    }
-    const fsMod = await import('fs').catch(() => null);
-    const pathMod = await import('path').catch(() => null);
-    if (!fsMod || !pathMod) return null;
-
-    const backupPath = pathMod.join(process.cwd(), 'src', 'lib', 'staticData.json');
-    if (!fsMod.existsSync(backupPath)) return null;
-    const raw = fsMod.readFileSync(backupPath, 'utf-8');
-    const data = JSON.parse(raw);
+    const data = await loadStaticDataSnapshot();
+    if (!data) return null;
 
     if (
       data?.settings?.turnstile_secret_key &&
@@ -265,16 +310,197 @@ async function resolveFromT2Backup(
       t2Loaded = true;
     }
   } catch {
-    // Ignore filesystem errors in edge environments without fs
+    // Ignore errors
   }
   return null;
 }
 
 /**
+ * Last-resort T3 fallback for clone/edge deployments where an app was added via Admin to Firestore
+ * (`store_data/secure_links` or `store_data/apps_chunk_0..1`) before a full GitHub vault code sync.
+ * Strictly guarded by a 60s circuit breaker and caches all discovered links in `ramCache` so
+ * subsequent requests resolve in T0_RAM (0ms, 0 external requests).
+ */
+async function resolveFromT3FirestoreRest(
+  identifier: string,
+  env?: Record<string, string | undefined>
+): Promise<string | null> {
+  if (Date.now() < t3CircuitBrokenUntil) return null;
+  const procEnv =
+    typeof process !== 'undefined' && process.env
+      ? (process.env as Record<string, string | undefined>)
+      : {};
+  const projectId = String(
+    env?.VITE_FIREBASE_PROJECT_ID ||
+      env?.FIREBASE_PROJECT_ID ||
+      procEnv.VITE_FIREBASE_PROJECT_ID ||
+      procEnv.FIREBASE_PROJECT_ID ||
+      ''
+  )
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  const apiKey = String(
+    env?.VITE_FIREBASE_API_KEY ||
+      env?.FIREBASE_API_KEY ||
+      procEnv.VITE_FIREBASE_API_KEY ||
+      procEnv.FIREBASE_API_KEY ||
+      ''
+  )
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  const rawDbId = String(
+    env?.VITE_FIREBASE_DATABASE_ID ||
+      env?.FIREBASE_DATABASE_ID ||
+      procEnv.VITE_FIREBASE_DATABASE_ID ||
+      procEnv.FIREBASE_DATABASE_ID ||
+      '(default)'
+  )
+    .replace(/^["']|["']$/g, '')
+    .trim();
+  const dbId =
+    !rawDbId ||
+    rawDbId.toLowerCase() === 'default' ||
+    rawDbId.toLowerCase() === '(default)' ||
+    rawDbId === 'undefined' ||
+    rawDbId === 'null' ||
+    rawDbId === projectId
+      ? '(default)'
+      : rawDbId;
+
+  if (!projectId) return null;
+
+  const baseUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(dbId)}/documents/store_data`;
+  const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey)}` : '';
+
+  const fromRestVal = (v: any): any => {
+    if (!v || typeof v !== 'object') return null;
+    if ('stringValue' in v) return v.stringValue;
+    if ('integerValue' in v) return Number(v.integerValue);
+    if ('doubleValue' in v) return Number(v.doubleValue);
+    if ('booleanValue' in v) return Boolean(v.booleanValue);
+    if ('nullValue' in v) return null;
+    if ('arrayValue' in v) return (v.arrayValue?.values || []).map(fromRestVal);
+    if ('mapValue' in v) {
+      const out: Record<string, any> = {};
+      const fields = v.mapValue?.fields || {};
+      for (const [k, fv] of Object.entries(fields)) out[k] = fromRestVal(fv);
+      return out;
+    }
+    return null;
+  };
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    try {
+      const [secRes, chunk0Res, chunk1Res] = await Promise.all([
+        fetch(`${baseUrl}/secure_links${keyParam}`, { signal: controller.signal }).catch(() => null),
+        fetch(`${baseUrl}/apps_chunk_0${keyParam}`, { signal: controller.signal }).catch(() => null),
+        fetch(`${baseUrl}/apps_chunk_1${keyParam}`, { signal: controller.signal }).catch(() => null),
+      ]);
+
+      // 1. Parse store_data/secure_links if present
+      if (secRes && secRes.ok) {
+        const secJson = await secRes.json().catch(() => null);
+        if (secJson?.fields) {
+          const secData = fromRestVal({ mapValue: { fields: secJson.fields } }) || {};
+          const items = Array.isArray(secData.items) ? secData.items : [];
+          const mapObj = await normalizeVaultPayloadToMap(items.length > 0 ? items : secData.links || secData, env);
+          primeRamVaultMap(mapObj);
+        }
+      }
+
+      // 2. Parse store_data/apps_chunk_0 & apps_chunk_1 if present
+      for (const cRes of [chunk0Res, chunk1Res]) {
+        if (cRes && cRes.ok) {
+          const cJson = await cRes.json().catch(() => null);
+          if (cJson?.fields) {
+            const cData = fromRestVal({ mapValue: { fields: cJson.fields } }) || {};
+            const apps = Array.isArray(cData.items) ? cData.items : [];
+            const mapObj = await normalizeVaultPayloadToMap(apps, env);
+            primeRamVaultMap(mapObj);
+          }
+        }
+      }
+
+      const resolved = lookupInMap(ramCache, identifier);
+      if (resolved) return resolved;
+
+      // If Firestore returned 403/429 on chunk0, engage 60s circuit breaker
+      if (chunk0Res && (chunk0Res.status === 403 || chunk0Res.status === 429 || chunk0Res.status >= 500)) {
+        t3CircuitBrokenUntil = Date.now() + 60_000;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    t3CircuitBrokenUntil = Date.now() + 60_000;
+  }
+  return null;
+}
+
+/**
+ * Resolves all candidate public Turnstile site keys across environment variables and Admin Settings.
+ * Real production keys (0x4...) always take precedence over any test keys (1x000...).
+ */
+export function getCandidateTurnstileSiteKeys(
+  env?: Record<string, string | undefined>
+): string[] {
+  const procEnv =
+    typeof process !== 'undefined' && process.env
+      ? (process.env as Record<string, string | undefined>)
+      : {};
+  const settingsSiteKey = (bundledStaticData as any)?.settings?.turnstile_site_key;
+  const rawCandidates = [
+    env?.VITE_TURNSTILE_SITE_KEY,
+    env?.TURNSTILE_SITE_KEY,
+    env?.CF_TURNSTILE_SITE_KEY,
+    env?.CLOUDFLARE_TURNSTILE_SITE_KEY,
+    env?.PUBLIC_TURNSTILE_SITE_KEY,
+    env?.NEXT_PUBLIC_TURNSTILE_SITE_KEY,
+    env?.VITE_TURNSTILE_KEY,
+    env?.TURNSTILE_KEY,
+    env?.CLOUDFLARE_TURNSTILE_KEY,
+    procEnv.VITE_TURNSTILE_SITE_KEY,
+    procEnv.TURNSTILE_SITE_KEY,
+    procEnv.CF_TURNSTILE_SITE_KEY,
+    procEnv.CLOUDFLARE_TURNSTILE_SITE_KEY,
+    procEnv.PUBLIC_TURNSTILE_SITE_KEY,
+    procEnv.NEXT_PUBLIC_TURNSTILE_SITE_KEY,
+    procEnv.VITE_TURNSTILE_KEY,
+    procEnv.TURNSTILE_KEY,
+    procEnv.CLOUDFLARE_TURNSTILE_KEY,
+    settingsSiteKey,
+  ];
+  const realKeys: string[] = [];
+  for (const c of rawCandidates) {
+    const clean = sanitizeKey(c);
+    if (isRealTurnstileKeyValue(clean) && !isTestTurnstileKey(clean)) {
+      if (!realKeys.includes(clean)) {
+        realKeys.push(clean);
+      }
+    }
+  }
+  return realKeys;
+}
+
+/**
+ * Resolves the primary public Turnstile site key from runtime environment variables or bundled/local staticData.json
+ * so `/api/v1/app/session-init` can supply it to clients even when `VITE_TURNSTILE_SITE_KEY` was added
+ * in Cloudflare Pages / Vercel environment settings after build time.
+ */
+export function getPublicTurnstileSiteKey(
+  env?: Record<string, string | undefined>
+): string {
+  const keys = getCandidateTurnstileSiteKeys(env);
+  return keys[0] || '';
+}
+
+/**
  * Resolves all candidate Cloudflare Turnstile secret keys across:
- * 1. Sealed `ENCRYPTED_TURNSTILE_SECRET` in `src/lib/secureVault.ts` (zero-Firebase static edge resolution)
- * 2. Admin Settings `turnstile_secret_key` (from local `staticData.json` on Node server)
- * 3. Environment variable `TURNSTILE_SECRET_KEY`
+ * 1. Environment variables (`TURNSTILE_SECRET_KEY`, `VITE_TURNSTILE_SECRET_KEY`, `CF_TURNSTILE_SECRET_KEY`, `TURNSTILE_TOKEN`, etc.)
+ * 2. Sealed `ENCRYPTED_TURNSTILE_SECRET` in `src/lib/secureVault.ts` (zero-Firebase static edge resolution)
+ * 3. Admin Settings `turnstile_secret_key` (from local or bundled `staticData.json`)
  *
  * Completely independent of Firebase/Firestore so Firebase quota exhaustion (429)
  * has zero impact on the /moreinfo gateway.
@@ -286,76 +512,98 @@ export async function getCandidateTurnstileSecrets(
     typeof process !== 'undefined' && process.env
       ? (process.env as Record<string, string | undefined>)
       : {};
-  const secrets: string[] = [];
+  const realSecrets: string[] = [];
+  const testSecrets: string[] = [];
+
   const addSecret = (s: unknown) => {
-    if (typeof s === 'string' && s.trim() && !secrets.includes(s.trim())) {
-      secrets.push(s.trim());
+    const clean = sanitizeKey(s);
+    if (!isRealTurnstileKeyValue(clean)) return;
+    if (isTestTurnstileKey(clean)) {
+      if (!testSecrets.includes(clean)) testSecrets.push(clean);
+    } else {
+      if (!realSecrets.includes(clean)) realSecrets.push(clean);
     }
   };
 
-  // 1. Check in-memory cached secret first
+  // 1. Always check runtime environment variables FIRST so any dashboard update is active immediately
+  const envCandidates = [
+    env?.TURNSTILE_SECRET_KEY,
+    env?.VITE_TURNSTILE_SECRET_KEY,
+    env?.CF_TURNSTILE_SECRET_KEY,
+    env?.CLOUDFLARE_TURNSTILE_SECRET_KEY,
+    env?.TURNSTILE_SECRET,
+    env?.VITE_TURNSTILE_SECRET,
+    env?.CF_TURNSTILE_SECRET,
+    env?.CLOUDFLARE_TURNSTILE_SECRET,
+    env?.TURNSTILE_TOKEN,
+    env?.VITE_TURNSTILE_TOKEN,
+    env?.CF_TURNSTILE_TOKEN,
+    env?.CLOUDFLARE_TURNSTILE_TOKEN,
+    procEnv.TURNSTILE_SECRET_KEY,
+    procEnv.VITE_TURNSTILE_SECRET_KEY,
+    procEnv.CF_TURNSTILE_SECRET_KEY,
+    procEnv.CLOUDFLARE_TURNSTILE_SECRET_KEY,
+    procEnv.TURNSTILE_SECRET,
+    procEnv.VITE_TURNSTILE_SECRET,
+    procEnv.CF_TURNSTILE_SECRET,
+    procEnv.CLOUDFLARE_TURNSTILE_SECRET,
+    procEnv.TURNSTILE_TOKEN,
+    procEnv.VITE_TURNSTILE_TOKEN,
+    procEnv.CF_TURNSTILE_TOKEN,
+    procEnv.CLOUDFLARE_TURNSTILE_TOKEN,
+  ];
+  for (const c of envCandidates) {
+    addSecret(c);
+  }
+
+  // 2. Check in-memory cached secret from store/vault
   if (
     cachedTurnstileSecretFromStore &&
     cachedTurnstileSecretFromStore.secret &&
     Date.now() < cachedTurnstileSecretFromStore.expiresAt
   ) {
     addSecret(cachedTurnstileSecretFromStore.secret);
-    addSecret(env?.TURNSTILE_SECRET_KEY);
-    addSecret(procEnv.TURNSTILE_SECRET_KEY);
-    return secrets;
+    return [...realSecrets, ...testSecrets];
   }
 
-  // 2. Decrypt sealed ENCRYPTED_TURNSTILE_SECRET from src/lib/secureVault.ts (works on Cloudflare Edge & Node with 0 I/O)
+  // 3. Decrypt sealed ENCRYPTED_TURNSTILE_SECRET from src/lib/secureVault.ts (works on Cloudflare Edge & Node with 0 I/O)
   try {
     if (ENCRYPTED_TURNSTILE_SECRET && typeof ENCRYPTED_TURNSTILE_SECRET === 'string') {
       const decSecret = await decryptVaultValue(ENCRYPTED_TURNSTILE_SECRET, env);
-      if (decSecret && decSecret.trim()) {
+      const cleanDec = sanitizeKey(decSecret);
+      if (cleanDec && isRealTurnstileKeyValue(cleanDec) && !isTestTurnstileKey(cleanDec)) {
         cachedTurnstileSecretFromStore = {
-          secret: decSecret.trim(),
+          secret: cleanDec,
           expiresAt: Date.now() + 3_600_000,
         };
-        addSecret(decSecret);
+        addSecret(cleanDec);
       }
     }
   } catch {
     // Ignore decryption error and continue to local backup / env var
   }
 
-  // 3. Try reading from local staticData.json (Node server)
+  // 4. Try reading from local or bundled staticData.json
   try {
-    if (typeof process !== 'undefined' && typeof process.cwd === 'function') {
-      const fsMod = await import('fs').catch(() => null);
-      const pathMod = await import('path').catch(() => null);
-      if (fsMod && pathMod) {
-        const backupPath = pathMod.join(process.cwd(), 'src', 'lib', 'staticData.json');
-        if (fsMod.existsSync(backupPath)) {
-          const raw = fsMod.readFileSync(backupPath, 'utf-8');
-          const parsed = JSON.parse(raw);
-          const sec = parsed?.settings?.turnstile_secret_key;
-          if (typeof sec === 'string' && sec.trim()) {
-            cachedTurnstileSecretFromStore = {
-              secret: sec.trim(),
-              expiresAt: Date.now() + 3_600_000,
-            };
-            addSecret(sec);
-          }
-        }
-      }
+    const parsed = await loadStaticDataSnapshot();
+    const sec = sanitizeKey(parsed?.settings?.turnstile_secret_key);
+    if (sec && isRealTurnstileKeyValue(sec) && !isTestTurnstileKey(sec)) {
+      cachedTurnstileSecretFromStore = {
+        secret: sec,
+        expiresAt: Date.now() + 3_600_000,
+      };
+      addSecret(sec);
     }
   } catch {
     // Ignore local fs errors on Edge
   }
 
-  addSecret(env?.TURNSTILE_SECRET_KEY);
-  addSecret(procEnv.TURNSTILE_SECRET_KEY);
-
-  return secrets;
+  return [...realSecrets, ...testSecrets];
 }
 
 /**
- * Resolves an app identifier (ID or slug) purely across static/in-memory tiers:
- * T0 (RAM Cache) -> T1 (ENCRYPTED_LINKS in src/lib/secureVault.ts) -> T2 (local staticData.json).
- * Zero Firebase / Firestore requests are ever made on the /moreinfo gateway path.
+ * Resolves an app identifier (ID or slug) across:
+ * T0 (RAM Cache) -> T1 (ENCRYPTED_LINKS in src/lib/secureVault.ts) -> T2 (staticData.json) -> T3 (Edge REST cache-on-miss).
  */
 export async function resolveDestinationUrl(
   appId: string,
@@ -378,10 +626,16 @@ export async function resolveDestinationUrl(
     return { url: t1, tier: 'T1_VAULT' };
   }
 
-  // T2: src/lib/staticData.json (Node server fallback)
+  // T2: src/lib/staticData.json (Node disk or Edge bundle)
   const t2 = await resolveFromT2Backup(cleanId, env);
   if (t2) {
     return { url: t2, tier: 'T2_BACKUP' };
+  }
+
+  // T3: Last-resort Edge REST lookup (for newly added apps on clones before GitHub vault rebuild)
+  const t3 = await resolveFromT3FirestoreRest(cleanId, env);
+  if (t3) {
+    return { url: t3, tier: 'T4_STORE_DATA' };
   }
 
   return { url: null, tier: 'NONE' };
